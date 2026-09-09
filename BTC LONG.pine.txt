@@ -1,0 +1,204 @@
+//@version=6
+indicator('BTCUSD LONG ONLY', overlay = true)
+
+
+// === INPUTS === //
+emaLen = input.int(5, title = 'EMA Length')
+rrRatio = input.float(1.0, title = 'Risk-Reward Ratio', minval = 0.5, maxval = 5.0, step = 0.1)
+ema = ta.ema(close, emaLen)
+plot(ema, title = 'EMA5', color = color.orange, linewidth = 2)
+
+
+// === VARIABLES === //
+var float untouchedHigh = na
+var float untouchedLow = na
+var int confirmationDeadline = na
+var int entryDeadline = na
+var bool waitingForConfirmation = false
+var bool waitingForEntry = false
+var bool entryTaken = false
+var bool inUntouchableSequence = false
+var bool pullbackTouched = false
+var float lowestLowInSequence = na
+var float highestHighInSequence = na
+var int lastEntryBar = na
+
+
+// === TRACKING ARRAYS === //
+var array<box> rrBoxes = array.new<box>()
+var array<int> entryBars = array.new<int>()
+var array<float> entryPrices = array.new<float>()
+var array<float> stopLosses = array.new<float>()
+var array<float> targets = array.new<float>()
+var array<int> tradeStatus = array.new<int>()
+
+
+// === STATISTICS === //
+var int totalWins = 0
+var int totalLosses = 0
+
+
+// === 1. DETECT UNTOUCHABLE CANDLE(S) === //
+isUntouchableCandle = open < ema and close < ema and high < ema and low < ema
+
+
+if not waitingForConfirmation and not waitingForEntry
+    if isUntouchableCandle
+        if not inUntouchableSequence
+            inUntouchableSequence := true
+            lowestLowInSequence := low
+            highestHighInSequence := high
+        else
+            if low < lowestLowInSequence
+                lowestLowInSequence := low
+            if high > highestHighInSequence
+                highestHighInSequence := high
+    else
+        if inUntouchableSequence
+            untouchedHigh := highestHighInSequence
+            untouchedLow := lowestLowInSequence
+            confirmationDeadline := bar_index + 12
+            waitingForConfirmation := true
+            inUntouchableSequence := false
+            entryTaken := false
+            pullbackTouched := false
+
+
+// === 2. CONFIRMATION PHASE === //
+if waitingForConfirmation and close > untouchedHigh
+    entryDeadline := bar_index + 12
+    waitingForConfirmation := false
+    waitingForEntry := true
+
+
+if waitingForConfirmation and bar_index > confirmationDeadline
+    untouchedHigh := na
+    untouchedLow := na
+    waitingForConfirmation := false
+    entryTaken := false
+    pullbackTouched := false
+
+
+// === 3. ENHANCED ENTRY PHASE === //
+validEntry = false
+
+
+if waitingForEntry and not entryTaken and bar_index <= entryDeadline and not na(untouchedHigh)
+    // Check if price has touched the untouchable high level
+    if low <= untouchedHigh and high >= untouchedHigh
+        pullbackTouched := true
+   
+    // Entry only after pullback has been confirmed
+    if pullbackTouched and low <= untouchedHigh
+        if na(lastEntryBar) or (bar_index - lastEntryBar) >= 7
+            validEntry := true
+            waitingForEntry := false
+            entryTaken := true
+            lastEntryBar := bar_index
+            pullbackTouched := false
+           
+            // Calculate levels with fixed percentages
+            float entryPrice = untouchedHigh
+            float stopLoss = entryPrice * 0.99  // 1% stop loss
+            float target = entryPrice * 1.005   // 0.2% take profit
+           
+            // Store trade data
+            array.push(entryBars, bar_index)
+            array.push(entryPrices, entryPrice)
+            array.push(stopLosses, stopLoss)
+            array.push(targets, target)
+            array.push(tradeStatus, 0)
+           
+            // Create risk-reward rectangle
+            newBox = box.new(left = bar_index, right = bar_index + 20, top = target, bottom = stopLoss, border_color = color.blue, bgcolor = color.new(color.blue, 85), border_width = 1)
+            array.push(rrBoxes, newBox)
+        else
+            waitingForEntry := false
+            entryTaken := false
+            untouchedHigh := na
+            untouchedLow := na
+            pullbackTouched := false
+
+
+if waitingForEntry and bar_index > entryDeadline
+    untouchedHigh := na
+    untouchedLow := na
+    waitingForEntry := false
+    entryTaken := false
+    pullbackTouched := false
+
+
+if entryTaken and bar_index > entryDeadline
+    untouchedHigh := na
+    untouchedLow := na
+    entryTaken := false
+
+
+// === 4. PLOT ENTRY TRIANGLES === //
+plotshape(validEntry, location = location.belowbar, color = color.green, style = shape.triangleup, size = size.small, title = 'Entry Signal')
+
+
+// === 5. CHECK TRADE OUTCOMES === //
+if array.size(tradeStatus) > 0
+    for i = 0 to array.size(tradeStatus) - 1
+        status = array.get(tradeStatus, i)
+        if status == 0
+            entryPrice = array.get(entryPrices, i)
+            stopLoss = array.get(stopLosses, i)
+            target = array.get(targets, i)
+           
+            // Check for win (target hit)
+            if high >= target
+                array.set(tradeStatus, i, 1)
+                totalWins += 1
+                // Change box color to green for win
+                if i < array.size(rrBoxes)
+                    currentBox = array.get(rrBoxes, i)
+                    box.set_bgcolor(currentBox, color.new(color.green, 75))
+                    box.set_border_color(currentBox, color.green)
+           
+            // Check for loss (stop loss hit)
+            else if low <= stopLoss
+                array.set(tradeStatus, i, -1)
+                totalLosses += 1
+                // Change box color to red for loss
+                if i < array.size(rrBoxes)
+                    currentBox = array.get(rrBoxes, i)
+                    box.set_bgcolor(currentBox, color.new(color.red, 75))
+                    box.set_border_color(currentBox, color.red)
+
+
+// === 6. CALCULATE STATISTICS === //
+totalTrades = totalWins + totalLosses
+ongoingTrades = array.size(tradeStatus) - totalTrades
+winRate = totalTrades > 0 ? math.round((totalWins / totalTrades) * 100, 1) : 0
+
+
+// === 7. ENHANCED STATISTICS TABLE === //
+var table statsTable = na
+
+
+if barstate.islast
+    if not na(statsTable)
+        table.delete(statsTable)
+   
+    statsTable := table.new(position = position.top_right, columns = 2, rows = 6, bgcolor = color.new(color.white, 20), border_width = 1)
+   
+    // Enhanced table with RR ratio
+    table.cell(statsTable, 0, 0, "TRADE STATS", text_color = color.black, text_size = size.normal)
+    table.cell(statsTable, 1, 0, "", text_color = color.black)
+   
+    table.cell(statsTable, 0, 1, "Total Wins", text_color = color.green, text_size = size.small)
+    table.cell(statsTable, 1, 1, str.tostring(totalWins), text_color = color.green, text_size = size.small)
+   
+    table.cell(statsTable, 0, 2, "Total Losses", text_color = color.red, text_size = size.small)
+    table.cell(statsTable, 1, 2, str.tostring(totalLosses), text_color = color.red, text_size = size.small)
+   
+    table.cell(statsTable, 0, 3, "Ongoing", text_color = color.blue, text_size = size.small)
+    table.cell(statsTable, 1, 3, str.tostring(ongoingTrades), text_color = color.blue, text_size = size.small)
+   
+    table.cell(statsTable, 0, 4, "Win Rate", text_color = color.black, text_size = size.small)
+    table.cell(statsTable, 1, 4, str.tostring(winRate) + "%", text_color = color.black, text_size = size.small)
+   
+    table.cell(statsTable, 0, 5, "RR Ratio", text_color = color.purple, text_size = size.small)
+    table.cell(statsTable, 1, 5, str.tostring(rrRatio), text_color = color.purple, text_size = size.small)

@@ -1,0 +1,345 @@
+//@version=6
+indicator('Ultimate 5 EMA Quant Engine [USDT Sizing] v2', overlay = true, max_boxes_count = 500)
+
+// ==============================================================================
+// === 1. TERMINAL CUSTOMIZATION & INPUTS
+// ==============================================================================
+grp_main = "1. Core & Environment"
+tf               = input.timeframe("15", title="Chart Timeframe (Default 15m)", group=grp_main)
+startEquity      = input.float(10000.0, title="Starting Equity (USDT)", group=grp_main)
+leverage         = input.int(50, title="Account Leverage (x)", minval=1, maxval=100, group=grp_main)
+maxConcurrent    = input.int(5, title="Max Concurrent Trades", minval=1, maxval=20, group=grp_main)
+
+grp_tech = "2. Technical Filters"
+emaLen           = input.int(5, title="EMA Length", group=grp_tech)
+volSmaLen        = input.int(20, title="Volume SMA Length", group=grp_tech)
+volMult          = input.float(1.2, title="Volume Multiplier", step=0.1, group=grp_tech)
+rsiLen           = input.int(14, title="RSI Length", group=grp_tech)
+rsiThresh        = input.float(50.0, title="Bearish RSI Threshold", group=grp_tech)
+
+grp_exec = "3. Execution Windows (No Cooldown)"
+confWindow       = input.int(12, title="Phase 2 Confirmation Window", group=grp_exec)
+entryWindow      = input.int(12, title="Phase 3 Entry Window", group=grp_exec)
+
+grp_risk = "4. Risk & Fees Engine"
+maxBaseRiskPct   = input.float(5.0, title="Max Base Risk Cap (%)", maxval=10.0, group=grp_risk) / 100
+perSideFee       = input.float(0.055, title="Bybit Per-Side Fee (%) [Taker=0.055, Maker=0.02]", step=0.005, group=grp_risk) / 100
+fixedSlPct       = input.float(1.0, title="Fixed Stop Loss (%)", step=0.1, group=grp_risk) / 100
+
+grp_grades = "5. Grade Adjustments (TP & Multiplier)"
+tpGradeA         = input.float(1.1, title="Grade A TP (%)", step=0.1, group=grp_grades) / 100
+tpGradeB         = input.float(0.9, title="Grade B TP (%)", step=0.1, group=grp_grades) / 100
+tpGradeC         = input.float(0.7, title="Grade C TP (%)", step=0.1, group=grp_grades) / 100
+tpGradeD         = input.float(0.5, title="Grade D TP (%)", step=0.1, group=grp_grades) / 100
+multGradeA       = input.float(1.00, title="Grade A Risk Mult", step=0.1, group=grp_grades)
+multGradeB       = input.float(0.75, title="Grade B Risk Mult", step=0.1, group=grp_grades)
+multGradeC       = input.float(0.50, title="Grade C Risk Mult", step=0.1, group=grp_grades)
+multGradeD       = input.float(0.40, title="Grade D Risk Mult", step=0.1, group=grp_grades)
+
+grp_live = "6. Live Paper Trading"
+enableAlerts     = input.bool(false, title="Enable Live Webhook Alerts", group=grp_live)
+
+// ==============================================================================
+// === 2. TECHNICAL INDICATORS (Multi-Timeframe Support)
+// ==============================================================================
+[r_open, r_high, r_low, r_close, r_vol] = request.security(syminfo.tickerid, tf, [open, high, low, close, volume])
+ema5   = ta.ema(r_close, emaLen)
+volSma = ta.sma(r_vol, volSmaLen)
+rsi    = ta.rsi(r_close, rsiLen)
+
+plot(ema5, title='EMA5', color=color.orange, linewidth=2)
+
+// ==============================================================================
+// === 3. STATE TRACKING VARIABLES
+// ==============================================================================
+var int firstBarTime    = time 
+var float untouchHigh   = na
+var float untouchLow    = na
+var int confDeadline    = na
+var int entryDeadline   = na
+
+var bool inSequence     = false
+var bool waitingPhase2  = false
+var bool waitingPhase3  = false
+
+var float seqHigh       = na
+var float seqLow        = na
+
+var string pendingGr    = ""
+var float pendingTp     = na
+var float pendingMult   = na
+
+// ==============================================================================
+// === 4. QUANT SIMULATOR & USDT DATA STRUCTURES
+// ==============================================================================
+var float liveEquity     = startEquity
+var float totalRisked    = 0.0
+var float totalNetProfit = 0.0
+
+var array<box> rrBoxes     = array.new<box>()
+var array<float> tradeEp   = array.new<float>() 
+var array<float> tradeSl   = array.new<float>() 
+var array<float> tradeTp   = array.new<float>() 
+var array<float> tradeUsdt = array.new<float>() 
+var array<string> tradeGr  = array.new<string>()
+var array<int> tradeSt     = array.new<int>()   
+
+var int w_A = 0, var int l_A = 0
+var int w_B = 0, var int l_B = 0
+var int w_C = 0, var int l_C = 0
+var int w_D = 0, var int l_D = 0
+
+int activeTrades = 0
+float allocatedMarginUsdt = 0.0
+
+if array.size(tradeSt) > 0
+    for i = 0 to array.size(tradeSt) - 1
+        if array.get(tradeSt, i) == 0
+            activeTrades += 1
+            allocatedMarginUsdt += (array.get(tradeUsdt, i) / leverage)
+
+float availEquity = math.max(0.0, liveEquity - allocatedMarginUsdt)
+
+// ==============================================================================
+// === 5. THE STRATEGY EXECUTION ENGINE
+// ==============================================================================
+
+// PHASE 1: Detect Sequence
+isUntouchable = r_open > ema5 and r_close > ema5 and r_high > ema5 and r_low > ema5
+
+if not waitingPhase2 and not waitingPhase3
+    if isUntouchable
+        if not inSequence
+            inSequence := true
+            seqLow := r_low
+            seqHigh := r_high
+        else
+            seqLow := math.min(seqLow, r_low)
+            seqHigh := math.max(seqHigh, r_high)
+    else
+        if inSequence
+            untouchHigh := seqHigh
+            untouchLow := seqLow
+            confDeadline := bar_index + confWindow
+            waitingPhase2 := true
+            inSequence := false
+
+// PHASE 2: Confirmation Breakdown & Grading 
+if waitingPhase2
+    if r_close < untouchLow
+        isHighVol = r_vol > (volSma * volMult)
+        isBearRsi = rsi < rsiThresh
+
+        if isHighVol and isBearRsi
+            pendingGr := "A", pendingTp := tpGradeA, pendingMult := multGradeA
+        else if isHighVol and not isBearRsi
+            pendingGr := "B", pendingTp := tpGradeB, pendingMult := multGradeB
+        else if not isHighVol and isBearRsi
+            pendingGr := "C", pendingTp := tpGradeC, pendingMult := multGradeC
+        else
+            pendingGr := "D", pendingTp := tpGradeD, pendingMult := multGradeD
+
+        entryDeadline := bar_index + entryWindow
+        waitingPhase2 := false
+    else if bar_index >= confDeadline
+        waitingPhase2 := false
+
+// PHASE 3: Pullback Limit Entry & USDT Position Sizing
+validEntrySignal = false
+float posUsdt = 0.0 
+
+if waitingPhase3
+    canTakeTrade = (activeTrades < maxConcurrent) and (availEquity > 10.0)
+
+    if r_high >= untouchLow and canTakeTrade
+        validEntrySignal := true
+        waitingPhase3 := false
+
+        totalWins = w_A + w_B + w_C + w_D
+        totalTrades = totalWins + (l_A + l_B + l_C + l_D)
+
+        realWinRate = totalTrades == 0 ? 0.75 : (totalWins / totalTrades)
+        mathWinRate = math.max(0.725, realWinRate) 
+
+        rrRatio = pendingTp / fixedSlPct
+        kellyVal = (mathWinRate - ((1.0 - mathWinRate) / rrRatio)) / 4.0
+        baseRisk = math.max(0.001, math.min(kellyVal, maxBaseRiskPct))
+
+        tradeRiskDollar = liveEquity * baseRisk * pendingMult
+        posUsdt := math.round(tradeRiskDollar / fixedSlPct)
+
+        reqMargin = math.round(posUsdt / leverage)
+
+        if reqMargin > availEquity
+            posUsdt := math.round(availEquity * leverage)
+
+        entryPrice = untouchLow
+        stopPrice  = entryPrice * (1.0 + fixedSlPct)
+        targPrice  = entryPrice * (1.0 - pendingTp)
+
+        array.push(tradeEp, entryPrice)
+        array.push(tradeSl, stopPrice)
+        array.push(tradeTp, targPrice)
+        array.push(tradeUsdt, posUsdt)
+        array.push(tradeGr, pendingGr)
+        array.push(tradeSt, 0)
+
+        color boxCol = pendingGr == "A" ? color.new(color.purple, 75) :
+                       pendingGr == "B" ? color.new(color.blue, 75) :
+                       pendingGr == "C" ? color.new(color.yellow, 75) : color.new(color.orange, 75)
+        b = box.new(left=bar_index, right=bar_index+15, top=stopPrice, bottom=targPrice, border_color=color.red, bgcolor=boxCol)
+        array.push(rrBoxes, b)
+
+    else if bar_index >= entryDeadline
+        waitingPhase3 := false
+
+plotshape(validEntrySignal, location=location.abovebar, color=color.red, style=shape.triangledown, size=size.small, title='Sell Signal')
+
+// --- LIVE PAPER TRADING ALERT SYSTEM ---
+if enableAlerts and validEntrySignal
+    alertMsg = '{"action": "SELL", "pair": "' + syminfo.ticker + '", "grade": "' + pendingGr + '", "leverage": ' + str.tostring(leverage) + ', "usdt_size": ' + str.tostring(posUsdt) + ', "tp_pct": ' + str.tostring(pendingTp*100) + '}'
+    alert(alertMsg, alert.freq_once_per_bar)
+
+// ==============================================================================
+// === 6. TRADE MANAGEMENT & USDT NET FEE CALCULATOR
+// ==============================================================================
+if array.size(tradeSt) > 0
+    for i = 0 to array.size(tradeSt) - 1
+        if array.get(tradeSt, i) == 0
+            ep    = array.get(tradeEp, i)
+            sl    = array.get(tradeSl, i)
+            tp    = array.get(tradeTp, i)
+            usdt  = array.get(tradeUsdt, i)
+            gr    = array.get(tradeGr, i)
+
+            if r_high >= sl
+                array.set(tradeSt, i, -1)
+
+                grossUsdt = usdt * fixedSlPct
+                entryFee  = usdt * perSideFee
+                exitFee   = usdt * (1.0 + fixedSlPct) * perSideFee
+                netUsdt   = grossUsdt + (entryFee + exitFee)
+
+                liveEquity     -= netUsdt
+                totalNetProfit -= netUsdt
+                totalRisked    += (usdt * fixedSlPct)
+
+                if gr == "A"
+                    l_A += 1
+                else if gr == "B"
+                    l_B += 1
+                else if gr == "C"
+                    l_C += 1
+                else if gr == "D"
+                    l_D += 1
+
+                box.set_bgcolor(array.get(rrBoxes, i), color.new(color.red, 75))
+                box.set_border_color(array.get(rrBoxes, i), color.red)
+
+            else if r_low <= tp
+                array.set(tradeSt, i, 1)
+
+                actualTpPct = (ep - tp) / ep
+
+                grossUsdt = usdt * actualTpPct
+                entryFee  = usdt * perSideFee
+                exitFee   = usdt * (1.0 - actualTpPct) * perSideFee
+                netUsdt   = grossUsdt - (entryFee + exitFee)
+
+                liveEquity     += netUsdt
+                totalNetProfit += netUsdt
+                totalRisked    += (usdt * fixedSlPct)
+
+                if gr == "A"
+                    w_A += 1
+                else if gr == "B"
+                    w_B += 1
+                else if gr == "C"
+                    w_C += 1
+                else if gr == "D"
+                    w_D += 1
+
+                box.set_bgcolor(array.get(rrBoxes, i), color.new(color.green, 75))
+                box.set_border_color(array.get(rrBoxes, i), color.green)
+
+// ==============================================================================
+// === 7. PROFESSIONAL MATRIX DASHBOARD
+// ==============================================================================
+var table dash = na
+if barstate.islast
+    if not na(dash)
+        table.delete(dash)
+
+    tot_W = w_A + w_B + w_C + w_D
+    tot_L = l_A + l_B + l_C + l_D
+    tot_Trades = tot_W + tot_L
+
+    winRateGlobal = tot_Trades > 0 ? (tot_W / tot_Trades) * 100 : 0
+    wr_A = (w_A + l_A) > 0 ? (w_A / (w_A + l_A)) * 100 : 0
+    wr_B = (w_B + l_B) > 0 ? (w_B / (w_B + l_B)) * 100 : 0
+    wr_C = (w_C + l_C) > 0 ? (w_C / (w_C + l_C)) * 100 : 0
+    wr_D = (w_D + l_D) > 0 ? (w_D / (w_D + l_D)) * 100 : 0
+
+    daysPassed = (time - firstBarTime) / 86400000
+    netPct = ((liveEquity - startEquity) / startEquity) * 100
+    rExp = totalRisked > 0 ? (totalNetProfit / totalRisked) : 0
+
+    dash := table.new(position.top_right, columns=6, rows=9, bgcolor=color.new(color.black, 15), border_width=1, border_color=color.gray)
+
+    table.cell(dash, 0, 0, "5 EMA QUANT MATRIX", text_color=color.white, text_halign=text.align_left)
+    table.cell(dash, 1, 0, "Days Data: " + str.tostring(daysPassed, "#.#"), text_color=color.gray)
+    table.cell(dash, 2, 0, "Timeframe: " + tf, text_color=color.gray)
+    table.cell(dash, 3, 0, "EMA Length: " + str.tostring(emaLen), text_color=color.gray)
+    table.cell(dash, 4, 0, "Lev: " + str.tostring(leverage) + "x", text_color=color.yellow)
+    table.cell(dash, 5, 0, "Net: " + str.tostring(netPct, "#.##") + "%", text_color=netPct>0?color.green:color.red)
+
+    table.cell(dash, 0, 1, "Balance (USDT):", text_color=color.gray, text_halign=text.align_left)
+    table.cell(dash, 1, 1, "$" + str.tostring(liveEquity, "#.##"), text_color=color.white)
+    table.cell(dash, 2, 1, "Active Trades:", text_color=color.gray)
+    table.cell(dash, 3, 1, str.tostring(activeTrades) + " / " + str.tostring(maxConcurrent), text_color=color.white)
+    table.cell(dash, 4, 1, "Expectancy:", text_color=color.gray)
+    table.cell(dash, 5, 1, str.tostring(rExp, "#.##") + " R", text_color=color.aqua)
+
+    table.cell(dash, 0, 2, "", bgcolor=color.new(color.black, 100))
+
+    table.cell(dash, 0, 3, "METRIC", text_color=color.white, text_halign=text.align_left)
+    table.cell(dash, 1, 3, "GLOBAL", text_color=color.white)
+    table.cell(dash, 2, 3, "GRADE A", text_color=color.purple)
+    table.cell(dash, 3, 3, "GRADE B", text_color=color.blue)
+    table.cell(dash, 4, 3, "GRADE C", text_color=color.yellow)
+    table.cell(dash, 5, 3, "GRADE D", text_color=color.orange)
+
+    table.cell(dash, 0, 4, "Total Trades", text_color=color.gray, text_halign=text.align_left)
+    table.cell(dash, 1, 4, str.tostring(tot_Trades), text_color=color.white)
+    table.cell(dash, 2, 4, str.tostring(w_A + l_A), text_color=color.white)
+    table.cell(dash, 3, 4, str.tostring(w_B + l_B), text_color=color.white)
+    table.cell(dash, 4, 4, str.tostring(w_C + l_C), text_color=color.white)
+    table.cell(dash, 5, 4, str.tostring(w_D + l_D), text_color=color.white)
+
+    table.cell(dash, 0, 5, "Total Wins", text_color=color.gray, text_halign=text.align_left)
+    table.cell(dash, 1, 5, str.tostring(tot_W), text_color=color.green)
+    table.cell(dash, 2, 5, str.tostring(w_A), text_color=color.green)
+    table.cell(dash, 3, 5, str.tostring(w_B), text_color=color.green)
+    table.cell(dash, 4, 5, str.tostring(w_C), text_color=color.green)
+    table.cell(dash, 5, 5, str.tostring(w_D), text_color=color.green)
+
+    table.cell(dash, 0, 6, "Total Losses", text_color=color.gray, text_halign=text.align_left)
+    table.cell(dash, 1, 6, str.tostring(tot_L), text_color=color.red)
+    table.cell(dash, 2, 6, str.tostring(l_A), text_color=color.red)
+    table.cell(dash, 3, 6, str.tostring(l_B), text_color=color.red)
+    table.cell(dash, 4, 6, str.tostring(l_C), text_color=color.red)
+    table.cell(dash, 5, 6, str.tostring(l_D), text_color=color.red)
+
+    table.cell(dash, 0, 7, "Accuracy (%)", text_color=color.gray, text_halign=text.align_left)
+    table.cell(dash, 1, 7, str.tostring(winRateGlobal, "#.##")+"%", text_color=color.white)
+    table.cell(dash, 2, 7, str.tostring(wr_A, "#.#")+"%", text_color=color.white)
+    table.cell(dash, 3, 7, str.tostring(wr_B, "#.#")+"%", text_color=color.white)
+    table.cell(dash, 4, 7, str.tostring(wr_C, "#.#")+"%", text_color=color.white)
+    table.cell(dash, 5, 7, str.tostring(wr_D, "#.#")+"%", text_color=color.white)
+
+    table.cell(dash, 0, 8, "Target (TP)", text_color=color.gray, text_halign=text.align_left)
+    table.cell(dash, 1, 8, "-", text_color=color.gray)
+    table.cell(dash, 2, 8, str.tostring(tpGradeA*100, "#.#")+"%", text_color=color.gray)
+    table.cell(dash, 3, 8, str.tostring(tpGradeB*100, "#.#")+"%", text_color=color.gray)
+    table.cell(dash, 4, 8, str.tostring(tpGradeC*100, "#.#")+"%", text_color=color.gray)
+    table.cell(dash, 5, 8, str.tostring(tpGradeD*100, "#.#")+"%", text_color=color.gray)

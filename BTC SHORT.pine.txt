@@ -1,0 +1,200 @@
+//@version=6
+indicator('BTCUSD SHORT ONLY', overlay = true)
+
+
+// === INPUTS === //
+emaLen = input.int(5, title = 'EMA Length')
+rrRatio = input.float(1.0, title = 'Risk-Reward Ratio', minval = 0.5, maxval = 5.0, step = 0.1)
+ema = ta.ema(close, emaLen)
+plot(ema, title = 'EMA5', color = color.orange, linewidth = 2)
+
+
+// === SELL VARIABLES === //
+var float sellUntouchedHigh = na
+var float sellUntouchedLow = na
+var int sellConfirmationDeadline = na
+var int sellEntryDeadline = na
+var bool sellWaitingForConfirmation = false
+var bool sellWaitingForEntry = false
+var bool sellEntryTaken = false
+var bool sellInUntouchableSequence = false
+var bool sellPullbackTouched = false
+var float sellLowestLowInSequence = na
+var float sellHighestHighInSequence = na
+var int lastSellEntryBar = na
+
+
+// === TRACKING ARRAYS === //
+var array<box> sellRrBoxes = array.new<box>()
+var array<int> sellEntryBars = array.new<int>()
+var array<float> sellEntryPrices = array.new<float>()
+var array<float> sellStopLosses = array.new<float>()
+var array<float> sellTargets = array.new<float>()
+var array<int> sellTradeStatus = array.new<int>()
+
+
+// === STATISTICS === //
+var int totalSellWins = 0
+var int totalSellLosses = 0
+
+
+// === 1. DETECT UNTOUCHABLE CANDLES === //
+isSellUntouchableCandle = open > ema and close > ema and high > ema and low > ema
+
+
+// === SELL LOGIC === //
+if not sellWaitingForConfirmation and not sellWaitingForEntry
+    if isSellUntouchableCandle
+        if not sellInUntouchableSequence
+            sellInUntouchableSequence := true
+            sellLowestLowInSequence := low
+            sellHighestHighInSequence := high
+        else
+            if low < sellLowestLowInSequence
+                sellLowestLowInSequence := low
+            if high > sellHighestHighInSequence
+                sellHighestHighInSequence := high
+    else
+        if sellInUntouchableSequence
+            sellUntouchedHigh := sellHighestHighInSequence
+            sellUntouchedLow := sellLowestLowInSequence
+            sellConfirmationDeadline := bar_index + 12
+            sellWaitingForConfirmation := true
+            sellInUntouchableSequence := false
+            sellEntryTaken := false
+            sellPullbackTouched := false
+
+
+// === SELL CONFIRMATION PHASE === //
+if sellWaitingForConfirmation and close < sellUntouchedLow
+    sellEntryDeadline := bar_index + 12
+    sellWaitingForConfirmation := false
+    sellWaitingForEntry := true
+
+if sellWaitingForConfirmation and bar_index > sellConfirmationDeadline
+    sellUntouchedHigh := na
+    sellUntouchedLow := na
+    sellWaitingForConfirmation := false
+    sellEntryTaken := false
+    sellPullbackTouched := false
+
+
+// === SELL ENTRY PHASE === //
+validSellEntry = false
+
+if sellWaitingForEntry and not sellEntryTaken and bar_index <= sellEntryDeadline and not na(sellUntouchedLow)
+    // Check if price has touched the untouchable low level
+    if low <= sellUntouchedLow and high >= sellUntouchedLow
+        sellPullbackTouched := true
+   
+    // Entry only after pullback has been confirmed
+    if sellPullbackTouched and low <= sellUntouchedLow
+        if na(lastSellEntryBar) or (bar_index - lastSellEntryBar) >= 7
+            validSellEntry := true
+            sellWaitingForEntry := false
+            sellEntryTaken := true
+            lastSellEntryBar := bar_index
+            sellPullbackTouched := false
+           
+            // Calculate levels with fixed percentages
+            float entryPrice = sellUntouchedLow
+            float stopLoss = entryPrice * 1.01  // 1% stop loss (above entry for sell)
+            float target = entryPrice * 0.998   // 0.2% take profit (below entry for sell)
+           
+            // Store trade data
+            array.push(sellEntryBars, bar_index)
+            array.push(sellEntryPrices, entryPrice)
+            array.push(sellStopLosses, stopLoss)
+            array.push(sellTargets, target)
+            array.push(sellTradeStatus, 0)
+           
+            // Create risk-reward rectangle
+            newBox = box.new(left = bar_index, right = bar_index + 20, top = stopLoss, bottom = target, border_color = color.red, bgcolor = color.new(color.red, 85), border_width = 1)
+            array.push(sellRrBoxes, newBox)
+        else
+            sellWaitingForEntry := false
+            sellEntryTaken := false
+            sellUntouchedHigh := na
+            sellUntouchedLow := na
+            sellPullbackTouched := false
+
+if sellWaitingForEntry and bar_index > sellEntryDeadline
+    sellUntouchedHigh := na
+    sellUntouchedLow := na
+    sellWaitingForEntry := false
+    sellEntryTaken := false
+    sellPullbackTouched := false
+
+if sellEntryTaken and bar_index > sellEntryDeadline
+    sellUntouchedHigh := na
+    sellUntouchedLow := na
+    sellEntryTaken := false
+
+
+// === PLOT ENTRY TRIANGLES === //
+plotshape(validSellEntry, location = location.abovebar, color = color.red, style = shape.triangledown, size = size.small, title = 'Sell Entry Signal')
+
+
+// === CHECK SELL TRADE OUTCOMES === //
+if array.size(sellTradeStatus) > 0
+    for i = 0 to array.size(sellTradeStatus) - 1
+        status = array.get(sellTradeStatus, i)
+        if status == 0
+            entryPrice = array.get(sellEntryPrices, i)
+            stopLoss = array.get(sellStopLosses, i)
+            target = array.get(sellTargets, i)
+           
+            // Check for win (target hit)
+            if low <= target
+                array.set(sellTradeStatus, i, 1)
+                totalSellWins += 1
+                // Change box color to green for win
+                if i < array.size(sellRrBoxes)
+                    currentBox = array.get(sellRrBoxes, i)
+                    box.set_bgcolor(currentBox, color.new(color.green, 75))
+                    box.set_border_color(currentBox, color.green)
+           
+            // Check for loss (stop loss hit)
+            else if high >= stopLoss
+                array.set(sellTradeStatus, i, -1)
+                totalSellLosses += 1
+                // Change box color to red for loss
+                if i < array.size(sellRrBoxes)
+                    currentBox = array.get(sellRrBoxes, i)
+                    box.set_bgcolor(currentBox, color.new(color.red, 75))
+                    box.set_border_color(currentBox, color.red)
+
+
+// === CALCULATE STATISTICS === //
+totalSellTrades = totalSellWins + totalSellLosses
+ongoingSellTrades = array.size(sellTradeStatus) - totalSellTrades
+sellWinRate = totalSellTrades > 0 ? math.round((totalSellWins / totalSellTrades) * 100, 1) : 0
+
+
+// === ENHANCED STATISTICS TABLE === //
+var table statsTable = na
+
+if barstate.islast
+    if not na(statsTable)
+        table.delete(statsTable)
+   
+    statsTable := table.new(position = position.top_right, columns = 2, rows = 6, bgcolor = color.new(color.white, 20), border_width = 1)
+   
+    // Enhanced table for short trades only
+    table.cell(statsTable, 0, 0, "SHORT STATS", text_color = color.black, text_size = size.normal)
+    table.cell(statsTable, 1, 0, "", text_color = color.black)
+   
+    table.cell(statsTable, 0, 1, "Total Wins", text_color = color.green, text_size = size.small)
+    table.cell(statsTable, 1, 1, str.tostring(totalSellWins), text_color = color.green, text_size = size.small)
+   
+    table.cell(statsTable, 0, 2, "Total Losses", text_color = color.red, text_size = size.small)
+    table.cell(statsTable, 1, 2, str.tostring(totalSellLosses), text_color = color.red, text_size = size.small)
+   
+    table.cell(statsTable, 0, 3, "Ongoing", text_color = color.blue, text_size = size.small)
+    table.cell(statsTable, 1, 3, str.tostring(ongoingSellTrades), text_color = color.blue, text_size = size.small)
+   
+    table.cell(statsTable, 0, 4, "Win Rate", text_color = color.black, text_size = size.small)
+    table.cell(statsTable, 1, 4, str.tostring(sellWinRate) + "%", text_color = color.black, text_size = size.small)
+   
+    table.cell(statsTable, 0, 5, "TP/SL", text_color = color.purple, text_size = size.small)
+    table.cell(statsTable, 1, 5, "0.2%/1%", text_color = color.purple, text_size = size.small)

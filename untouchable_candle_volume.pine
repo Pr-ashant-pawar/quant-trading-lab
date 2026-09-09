@@ -1,0 +1,4 @@
+//@version=6
+// Source not included because the complete Strategy 02 code was not present
+// in the retrieved user-provided file. This prevents accidental fabrication.
+indicator("Strategy 02 - Source Pending", overlay=true)
